@@ -3,18 +3,16 @@ from __future__ import print_function
 import warnings
 import time
 import copy
-import scipy.io as sio
 from utils import *
-from models import HGCN
+from models import IMCN
 from coarsen import *
 warnings.filterwarnings('ignore')
-
 
 # Settings
 flags = tf.app.flags
 FLAGS = flags.FLAGS
 # dataset
-flags.DEFINE_string('dataset', 'citeseer', 'Dataset string.')  # cora, citeseer, pubmed, photo, cs, computer, physics
+flags.DEFINE_string('dataset', 'cora', 'Dataset string.')  # cora, citeseer, pubmed, photo, cs, computer, physics
 flags.DEFINE_integer('public', 0, '1: 20 pre class; 0: for label rate')
 flags.DEFINE_float('percent', 0.005, 'Label rate.')
 
@@ -26,11 +24,11 @@ flags.DEFINE_float('weight_decay', 0.05, 'Weight for L2 loss on embedding matrix
 
 # parameters for computing loss
 flags.DEFINE_float('class_decay', 0.3, 'decay of updating class centroids.')
-flags.DEFINE_float('temperature', 0.1, 'temperature for similarity between node embedding and class centroids.')
-flags.DEFINE_float('lam1', 0, 'Weight for node-wise consistency.')
+flags.DEFINE_float('temperature', 0.1, 'temperature in the similarity of node representation to class centroids.')
+flags.DEFINE_float('lam1', 1.5, 'Weight for node-wise consistency.')
 flags.DEFINE_float('lam2', 1, 'Weight for class centroid difference.')
-flags.DEFINE_float('lam3', 1.5, 'Weight for distribution difference.')
-flags.DEFINE_float('h_mlp_percent', 0.3, 'h_mlp_percent in the final embedding.')
+flags.DEFINE_float('lam3', 1, 'Weight for distribution difference.')
+flags.DEFINE_float('h_mlp_percent', 0.3, 'h_mlp_percent in the final node embedding.')
 
 # parameters for coarsening the graph
 flags.DEFINE_integer('node_wgt_embed_dim', 5, 'Number of units for node weight embedding.')
@@ -67,15 +65,19 @@ for i in range(FLAGS.coarsen_level):
 for i in range(len(adj_list)):
     adj_list[i] = [preprocess_adj(adj_list[i])]
 
-best = 0.0
 best_test_acc_mat = []
 for iter in range(1, 11):
     np.random.seed(FLAGS.seed + iter)
     tf.set_random_seed(FLAGS.seed + iter)
 
     # Load data
-    adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data_rate(FLAGS.dataset, FLAGS.public,
-                                                                                            FLAGS.percent, FLAGS.seed+iter)
+    if FLAGS.dataset == 'photo' or FLAGS.dataset == 'computer' or FLAGS.dataset == 'cs':
+        adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data0(FLAGS.dataset)
+    else:
+        adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data_rate(FLAGS.dataset,
+                                                                                                FLAGS.public,
+                                                                                                FLAGS.percent,
+                                                                                                FLAGS.seed+iter)
 
     n_inst = np.shape(y_train)[0]
     n_class = np.shape(y_train)[1]
@@ -114,7 +116,7 @@ for iter in range(1, 11):
     mats_intra_inter[0] += np.eye(num_labeled)
 
     # Create model
-    model = HGCN(placeholders, n_inst=n_inst, input_dim=features[2][1], transfer_list=transfer_list, adj_list=adj_list,
+    model = IMCN(placeholders, n_inst=n_inst, input_dim=features[2][1], transfer_list=transfer_list, adj_list=adj_list,
                  node_wgt_list=node_wgt_list, train_idx=train_idx, mat01_tr_te=mats_intra_inter)
 
     # Initialize session
@@ -142,8 +144,7 @@ for iter in range(1, 11):
         # Training
         feed_dict = construct_feed_dict(features, y_train, train_mask, placeholders)
         feed_dict.update({placeholders['dropout']: FLAGS.dropout})
-        outs = sess.run([model.opt_op, model.loss, model.accuracy, model.l_ce, model.l_se, model.l_ds, model.l_cn,
-                         model.out_hgcn, model.out_gcn2, model.outs],
+        outs = sess.run([model.opt_op, model.loss, model.accuracy, model.l_ce, model.l_se, model.l_ds, model.l_cnu, model.l_cns],
                         feed_dict=feed_dict)
         cost_train.append(outs[1])
         acc_train.append(outs[2])
@@ -162,12 +163,6 @@ for iter in range(1, 11):
             best_epoch = epoch
             best_test_acc = test_acc
 
-            # if best_test_acc > best:
-            #     best = best_test_acc
-            #     sio.savemat("h_hgcn.mat", {"array": np.array(outs[7])})
-            #     sio.savemat("h_gcn2.mat", {"array": np.array(outs[8])})
-            #     sio.savemat("h_final.mat", {"array": np.array(outs[9])})
-
         # Print results
         print("Iter:", '%02d' % iter,
               "Epoch:", '%04d' % epoch,
@@ -175,11 +170,12 @@ for iter in range(1, 11):
               "l_ce=", "{:.5f}".format(outs[3]),
               "l_se=", "{:.5f}".format(outs[4]),
               "l_ds=", "{:.5f}".format(outs[5]),
-              "l_cn=", "{:.5f}".format(outs[6]),
+              "l_cnu=", "{:.5f}".format(outs[6]),
+              "l_cns=", "{:.5f}".format(outs[7]),
               "train_acc=", "{:.5f}".format(outs[2]),
               "val_acc=", "{:.5f}".format(val_acc),
               "test_acc=", "{:.5f}".format(test_acc),
-              "best_acc=", "{:.5f}".format(best_test_acc), )
+              "best_test_acc=", "{:.5f}".format(best_test_acc), )
 
     print('** Best test accuracy ({:02d}):  {:.5f}\n'.format(best_epoch, best_test_acc))
     best_test_acc_mat.append(best_test_acc)
@@ -189,5 +185,3 @@ print("Final test acc:")
 print("mean acc: {:.5f}, std: {:.5f}.".format(np.mean(best_test_acc_mat), np.std(best_test_acc_mat)))
 print("best one: {:.5f}.".format(np.max(best_test_acc_mat)))
 print("------------------------------------------------")
-
-

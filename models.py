@@ -1,7 +1,4 @@
 import os
-
-import numpy as np
-
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from scipy import sparse
 from layers import *
@@ -12,7 +9,7 @@ flags = tf.app.flags
 FLAGS = flags.FLAGS
 
 
-class HGCN(object):
+class IMCN(object):
     def __init__(self, placeholders, n_inst, input_dim, transfer_list, adj_list, node_wgt_list, train_idx, mat01_tr_te):
         self.placeholders = placeholders
         self.n_inst = n_inst
@@ -143,7 +140,7 @@ class HGCN(object):
         self.GCN2activations.append(hidden)
         self.out_gcn2 = tf.nn.l2_normalize(self.GCN2activations[-1], dim=1)
 
-        self.outs = tf.nn.l2_normalize((1.0-FLAGS.h_mlp_percent) * self.out_hgcn + FLAGS.h_mlp_percent * self.out_gcn2, dim=1)
+        self.outs = tf.nn.l2_normalize((1-FLAGS.h_mlp_percent) * self.out_hgcn + FLAGS.h_mlp_percent * self.out_gcn2, dim=1)
 
     def _loss(self):
         # Weight decay loss
@@ -160,7 +157,7 @@ class HGCN(object):
                                                  self.placeholders['labels_mask'])
 
         # l_cnu and l_cns: contrastive loss
-        self.contrastiveloss()
+        self.contrastiveloss_modify()
 
         # l_se: semantic centroid alignment of labeled nodes
         # l_ds: distribution difference of unlabeled nodes
@@ -266,173 +263,40 @@ class HGCN(object):
     def predict(self):
         return tf.nn.softmax(self.outs)
 
+    def contrastiveloss_modify(self):
+        # compute the unsupervised contrastive loss
+        u_cos_dist = tf.exp(tf.matmul(self.out_gcn2, tf.transpose(self.out_hgcn)) / 0.5)
+        u_pos = tf.reduce_sum(tf.diag_part(u_cos_dist))
+        u_neg = tf.reduce_sum(u_cos_dist) #- u_pos
+        self.l_cnu = - tf.log(u_pos/u_neg)#/int(u_cos_dist.shape[0])
 
-class MLP(object):
-    def __init__(self, placeholders, input_dim, train_idx):
-        self.placeholders = placeholders
-        self.n_class = placeholders['labels'].get_shape().as_list()[1]
-        self.inputs = placeholders['features']
-        self.input_dim = input_dim
-        self.output_dim = placeholders['labels'].get_shape().as_list()[1]
-        self.train_idx = train_idx
+        # compute the supervised contrastive loss
+        h1 = tf.gather(self.out_gcn2, self.train_idx, axis=0)
+        h2 = tf.gather(self.out_hgcn, self.train_idx, axis=0)
+        s_cos_dist = tf.exp(tf.matmul(h1, tf.transpose(h2)) / 0.5)
+        s_pos = tf.reduce_sum(s_cos_dist * self.mat01_tr_te[0])
+        s_neg = tf.reduce_sum(s_cos_dist)# - s_pos
+        self.l_cns = -tf.log(s_pos/s_neg)#/int(s_cos_dist.shape[0])  # tf.cast(tf.reduce_sum(self.mat01_tr_te[0]), tf.float32)
 
-        self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
-
-        self.MLPlayers = []
-        self.activations = []
-        self.out_h = []
-        self.opt_op = None
-
-        self.loss = 0.
-        self.l_ce = 0.
-
-        self.build()
-
-    def _build(self):
-        # 2-layer MLP
-        self.activations.append(self.inputs)
-        self.MLPlayers.append(GraphConvolution2(input_dim=self.input_dim,
-                                                 output_dim=FLAGS.hidden,
-                                                 placeholders=self.placeholders,
-                                                 act=tf.nn.relu,
-                                                 dropout=True,
-                                                 sparse_inputs=True))
-        layer = self.MLPlayers[-1]
-        hidden = layer(self.inputs)
-        self.activations.append(hidden)
-
-        self.MLPlayers.append(GraphConvolution2(input_dim=FLAGS.hidden,
-                                                 output_dim=self.output_dim,
-                                                 placeholders=self.placeholders,
-                                                 act=lambda x: x,
-                                                 dropout=True))
-        layer = self.MLPlayers[-1]
-        hidden = layer(self.activations[-1])
-        self.activations.append(hidden)
-        self.out_h = tf.nn.l2_normalize(self.activations[-1], dim=1)
-
-    def _loss(self):
-        # Weight decay loss
-        for i in range(len(self.MLPlayers)):
-            for var in self.MLPlayers[i].vars.values():
-                self.loss += FLAGS.weight_decay * tf.nn.l2_loss(var)
-
-        self.l_ce = masked_softmax_cross_entropy(self.out_h, self.placeholders['labels'],
-                                                 self.placeholders['labels_mask'])
-        self.loss += self.l_ce
-
-    def _accuracy(self):
-        self.accuracy = masked_accuracy(self.out_h, self.placeholders['labels'], self.placeholders['labels_mask'])
-
-    def build(self):
-        self._build()
-        self._loss()
-        self._accuracy()
-        self.opt_op = self.optimizer.minimize(self.loss)
-
-    def predict(self):
-        return tf.nn.softmax(self.out_h)
-
-
-class MLP_homophily(object):
-    def __init__(self, placeholders, input_dim, adj_loop, y_train, train_idx):
-        self.placeholders = placeholders
-        self.n_class = placeholders['labels'].get_shape().as_list()[1]
-        self.inputs = placeholders['features']
-        self.input_dim = input_dim
-        self.output_dim = placeholders['labels'].get_shape().as_list()[1]
-        self.adj_loop = adj_loop
-        self.y_train = y_train
-        self.train_idx = train_idx
-
-        self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
-
-        self.MLPlayers = []
-        self.activations = []
-        self.out_h = []
-        self.class_centroid = tf.zeros(shape=(self.n_class, self.output_dim))  # clss * out_dim
-
-        self.loss = 0.
-        self.l_ce = 0.
-        self.l_hp = 0.
-        self.opt_op = None
-
-        self.build()
-
-    def _build(self):
-        # 2-layer MLP
-        self.activations.append(self.inputs)
-        self.MLPlayers.append(GraphConvolution2(input_dim=self.input_dim,
-                                                 output_dim=FLAGS.hidden,
-                                                 placeholders=self.placeholders,
-                                                 act=tf.nn.relu,
-                                                 dropout=True,
-                                                 sparse_inputs=True))
-        layer = self.MLPlayers[-1]
-        hidden = layer(self.inputs)
-        self.activations.append(hidden)
-
-        self.MLPlayers.append(GraphConvolution2(input_dim=FLAGS.hidden,
-                                                 output_dim=self.output_dim,
-                                                 placeholders=self.placeholders,
-                                                 act=lambda x: x,
-                                                 dropout=True))
-        layer = self.MLPlayers[-1]
-        hidden = layer(self.activations[-1])
-        self.activations.append(hidden)
-        self.out_h = tf.nn.l2_normalize(self.activations[-1], dim=1)
-
-    def _loss(self):
-        # Weight decay loss
-        for i in range(len(self.MLPlayers)):
-            for var in self.MLPlayers[i].vars.values():
-                self.loss += FLAGS.weight_decay * tf.nn.l2_loss(var)
-
-        self.l_ce = masked_softmax_cross_entropy(self.out_h, self.placeholders['labels'],
-                                                 self.placeholders['labels_mask'])
-        self.l_hp = self.homophilyLoss()
-
-        self.loss += self.l_ce + FLAGS.lam * self.l_hp
-
-    def homophilyLoss(self):
-        fea = self.out_h
-
-        # hidden embeddings and labels of training set
-        y_train = tf.gather(self.placeholders['labels'], self.train_idx, axis=0)
-        fea_train = tf.nn.l2_normalize(tf.gather(fea, self.train_idx, axis=0), dim=1)
-
-        # number of samples in each class for training set
-        n_sample_classes = tf.reduce_sum(y_train, axis=0)
-        ones_num = tf.ones_like(n_sample_classes)
-        n_sample_classes = tf.where(n_sample_classes < 1.0, ones_num, n_sample_classes)
-
-        # calculating centroids: sum the features and divide
-        d = fea.shape[1]
-        sum_feature = tf.matmul(tf.transpose(y_train), fea_train)
-        n_sample_classes_ma = tf.matmul(tf.reshape(n_sample_classes, [-1, 1]), tf.ones([1, d], dtype=tf.float32))
-        current_centroid = tf.div(sum_feature, n_sample_classes_ma)
-
-        # updating class centroids
-        self.class_centroid = (1 - FLAGS.mu) * self.class_centroid + FLAGS.mu * current_centroid
-
-        # node-to-class predication
-        pred_logit = tf.nn.softmax(tf.matmul(fea, tf.transpose(self.class_centroid)) / FLAGS.t)
-        zeros_tf = tf.zeros_like(pred_logit)
-        pred_logit = tf.where(pred_logit < 1e-4, zeros_tf, pred_logit)
-        adj_loop = tf.convert_to_tensor(self.adj_loop.toarray(), dtype=tf.float32)
-        dis = tf.reduce_sum(tf.square(tf.matmul(pred_logit, tf.transpose(pred_logit)) - adj_loop))
-        homo_loss = tf.sqrt(dis) / self.adj_loop.data.shape[0]
-
-        return homo_loss
-
-    def _accuracy(self):
-        self.accuracy = masked_accuracy(self.out_h, self.placeholders['labels'], self.placeholders['labels_mask'])
-
-    def build(self):
-        self._build()
-        self._loss()
-        self._accuracy()
-        self.opt_op = self.optimizer.minimize(self.loss)
-
-    def predict(self):
-        return tf.nn.softmax(self.out_h)
+    # def contrastiveloss_modify(self):
+    #     # compute the unsupervised contrastive loss
+    #     u_sim_11 = tf.exp(tf.matmul(self.out_gcn2, tf.transpose(self.out_gcn2)) / 0.5)
+    #     u_sim_22 = tf.exp(tf.matmul(self.out_hgcn, tf.transpose(self.out_hgcn)) / 0.5)
+    #     u_sim_12 = tf.exp(tf.matmul(self.out_gcn2, tf.transpose(self.out_hgcn)) / 0.5)
+    #
+    #     u_pos_11 = tf.reduce_sum(tf.diag_part(u_sim_11))
+    #     u_pos_22 = tf.reduce_sum(tf.diag_part(u_sim_22))
+    #     u_pos_12 = tf.reduce_sum(tf.diag_part(u_sim_12))
+    #
+    #
+    #     u_pos = tf.reduce_sum(tf.diag_part(u_cos_dist))
+    #     u_neg = tf.reduce_sum(u_cos_dist) #- u_pos
+    #     self.l_cnu = - tf.log(u_pos/u_neg)/int(u_cos_dist.shape[0])
+    #
+    #     # compute the supervised contrastive loss
+    #     h1 = tf.gather(self.out_gcn2, self.train_idx, axis=0)
+    #     h2 = tf.gather(self.out_hgcn, self.train_idx, axis=0)
+    #     s_cos_dist = tf.exp(tf.matmul(h1, tf.transpose(h2)) / 0.5)
+    #     s_pos = tf.reduce_sum(s_cos_dist * self.mat01_tr_te[0])
+    #     s_neg = tf.reduce_sum(s_cos_dist)# - s_pos
+    #     self.l_cns = -tf.log(s_pos/s_neg)/int(s_cos_dist.shape[0])
